@@ -30,3 +30,6 @@ CMakeLists.txt.user
 *.exe
 *.out
 *.app
+
+# Others
+build/

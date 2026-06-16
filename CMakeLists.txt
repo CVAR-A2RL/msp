@@ -96,6 +96,10 @@ if(BUILD_EXAMPLES)
     add_executable(client_read_test examples/client_read_test.cpp)
     target_link_libraries(client_read_test mspclient)
 
+    # MSP round-trip latency benchmark
+    add_executable(msp_latency_test examples/msp_latency_test.cpp)
+    target_link_libraries(msp_latency_test mspclient)
+
 endif()
 
 ################################################################################
