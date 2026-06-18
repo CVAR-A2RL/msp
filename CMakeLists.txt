@@ -100,6 +100,14 @@ if(BUILD_EXAMPLES)
     add_executable(msp_latency_test examples/msp_latency_test.cpp)
     target_link_libraries(msp_latency_test mspclient)
 
+    # Individual RTT test (interleaved, avoids stale-ID artifact)
+    add_executable(msp_rtt_test examples/msp_rtt_test.cpp)
+    target_link_libraries(msp_rtt_test mspclient)
+
+    # Async throughput test (subscribe-based, finds bandwidth ceiling)
+    add_executable(msp_throughput_test examples/msp_throughput_test.cpp)
+    target_link_libraries(msp_throughput_test mspclient)
+
 endif()
 
 ################################################################################
