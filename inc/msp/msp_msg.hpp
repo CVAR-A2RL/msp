@@ -151,6 +151,7 @@ enum class ID : uint16_t {
     MSP_GPS_CONFIG                     = 132,  // out message
     MSP_COMPASS_CONFIG                 = 133,  // out message
     MSP_ESC_SENSOR_DATA                = 134,  // out message
+    MSP_MOTOR_TELEMETRY                = 139,  // out message (Betaflight API >= 1.42)
     MSP_STATUS_EX                      = 150,
     MSP_SENSOR_STATUS                  = 151,  // only iNav
     MSP_UID                            = 160,
@@ -3912,6 +3913,11 @@ struct MotorConfigSettings {
     Value<uint16_t> min_throttle;
     Value<uint16_t> max_throttle;
     Value<uint16_t> min_command;
+    // API >= 1.42 (Betaflight)
+    Value<uint8_t>  motor_count;
+    Value<uint8_t>  motor_poles;
+    Value<uint8_t>  use_dshot_telemetry;
+    Value<uint8_t>  use_esc_sensor;
 };
 
 struct MotorConfig : public MotorConfigSettings, public Message {
@@ -3924,6 +3930,12 @@ struct MotorConfig : public MotorConfigSettings, public Message {
         rc &= data.unpack(min_throttle);
         rc &= data.unpack(max_throttle);
         rc &= data.unpack(min_command);
+        if(data.unpacking_remaining() >= 4) {
+            rc &= data.unpack(motor_count);
+            rc &= data.unpack(motor_poles);
+            rc &= data.unpack(use_dshot_telemetry);
+            rc &= data.unpack(use_esc_sensor);
+        }
         return rc;
     }
 };
@@ -3987,6 +3999,45 @@ struct EscSensorData : public Message {
             rc &= data.unpack(esc.temperature);
             rc &= data.unpack(esc.rpm);
             esc_data.push_back(esc);
+        }
+        return rc;
+    }
+};
+
+struct MotorTelemetryData {
+    Value<uint32_t> rpm;          // mechanical RPM (already converted from eRPM by firmware)
+    Value<uint16_t> invalid_pct;  // 10000 = 100.00%
+    Value<uint8_t>  temperature;  // °C
+    Value<uint16_t> voltage;      // 0.01 V/unit
+    Value<uint16_t> current;      // 0.01 A/unit
+    Value<uint16_t> consumption;  // mAh
+};
+
+struct MotorTelemetry : public Message {
+    MotorTelemetry(FirmwareVariant v) : Message(v) {}
+
+    virtual ID id() const override { return ID::MSP_MOTOR_TELEMETRY; }
+
+    Value<uint8_t> motor_count;
+    std::vector<MotorTelemetryData> motor_telemetry;
+
+    virtual bool decode(const ByteVector& data) override {
+        motor_telemetry.clear();
+        if(data.unpacking_remaining() == 0) {
+            motor_count = 0;
+            return true;
+        }
+        bool rc = true;
+        rc &= data.unpack(motor_count);
+        for(size_t i = 0; i < static_cast<size_t>(motor_count()); ++i) {
+            MotorTelemetryData m;
+            rc &= data.unpack(m.rpm);
+            rc &= data.unpack(m.invalid_pct);
+            rc &= data.unpack(m.temperature);
+            rc &= data.unpack(m.voltage);
+            rc &= data.unpack(m.current);
+            rc &= data.unpack(m.consumption);
+            motor_telemetry.push_back(m);
         }
         return rc;
     }
