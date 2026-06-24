@@ -1,6 +1,8 @@
 #include <Client.hpp>
 #include <cstdlib>
 #include <iostream>
+#include <linux/serial.h>
+#include <sys/ioctl.h>
 
 typedef unsigned int uint;
 
@@ -53,6 +55,16 @@ bool Client::connectPort(const std::string& device, const size_t baudrate) {
             asio::serial_port::character_size(8)));
         port.set_option(
             asio::serial_port::stop_bits(asio::serial_port::stop_bits::one));
+
+        // Ask the kernel TTY layer to deliver bytes to the application
+        // immediately rather than waiting to fill an inter-character gap.
+        // Without this the TTY driver may buffer a full MSP response for
+        // several hundred µs before waking ASIO, capping effective poll rate.
+        struct serial_struct serial_info;
+        if(ioctl(port.native_handle(), TIOCGSERIAL, &serial_info) == 0) {
+            serial_info.flags |= ASYNC_LOW_LATENCY;
+            ioctl(port.native_handle(), TIOCSSERIAL, &serial_info);
+        }
     }
     catch(const std::system_error& e) {
         const int ecode = e.code().value();
