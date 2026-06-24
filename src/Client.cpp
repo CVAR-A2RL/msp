@@ -388,11 +388,22 @@ std::pair<iterator, bool> Client::messageReady(iterator begin,
         if(available < 6) return std::make_pair(begin, false);
 
         const uint8_t payload_size = uint8_t(*(i + 3));
-        // incomplete xfer
-        if(available < size_t(5 + payload_size + 1))
-            return std::make_pair(begin, false);
-
-        std::advance(i, 5 + payload_size + 1);
+        if(payload_size >= JUMBO_FRAME_MIN_SIZE) {
+            // JUMBO frame: layout is $M dir size(255) cmd lo hi [payload×N] CRC
+            // need at least 7 bytes to read the 2-byte real-size field
+            if(available < 7) return std::make_pair(begin, false);
+            const uint16_t real_size = uint8_t(*(i + 5))
+                                     | (uint16_t(uint8_t(*(i + 6))) << 8);
+            // full frame = 8 + real_size bytes ($+M+dir+size+cmd+lo+hi + payload + CRC)
+            if(available < size_t(8 + real_size))
+                return std::make_pair(begin, false);
+            std::advance(i, 8 + real_size);
+        } else {
+            // incomplete xfer
+            if(available < size_t(5 + payload_size + 1))
+                return std::make_pair(begin, false);
+            std::advance(i, 5 + payload_size + 1);
+        }
     }
     else if(*i == '$' && *(i + 1) == 'X') {
         // not even enough data for a header
