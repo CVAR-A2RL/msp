@@ -14,13 +14,17 @@ bool FlightController::connect(const std::string &device, const size_t baudrate,
                                const double &timeout, const bool print_info) {
     if(!client_.start(device, baudrate)) return false;
 
-    msp::msg::FcVariant fcvar(fw_variant_);
-    if(client_.sendMessage(fcvar, 1.0) && !fcvar.identifier().empty()) {
-        fw_variant_ = msp::variant_map.at(fcvar.identifier());
-        client_.setVariant(fw_variant_);
-        if(print_info) std::cout << fcvar;
+    bool fcvar_ok = false;
+    for(int attempt = 0; attempt < 5 && !fcvar_ok; ++attempt) {
+        msp::msg::FcVariant fcvar(fw_variant_);
+        if(client_.sendMessage(fcvar, 1.0) && !fcvar.identifier().empty()) {
+            fw_variant_ = msp::variant_map.at(fcvar.identifier());
+            client_.setVariant(fw_variant_);
+            if(print_info) std::cout << fcvar;
+            fcvar_ok = true;
+        }
     }
-    else {
+    if(!fcvar_ok) {
         std::cerr
             << "cannot determine the flight controller variant (MSP_FC_VARIANT)"
             << std::endl;
@@ -65,7 +69,7 @@ bool FlightController::connect(const std::string &device, const size_t baudrate,
     if(print_info) std::cout << ident;
     capabilities_ = ident.capabilities;
 
-    // get boxes
+    // get boxes (5 s timeout guards against silent hang on newer firmware)
     initBoxes();
 
     // determine channel mapping
@@ -205,12 +209,12 @@ std::string FlightController::getBoardName() const { return board_name_; }
 void FlightController::initBoxes() {
     // get box names
     msp::msg::BoxNames box_names(fw_variant_);
-    if(!client_.sendMessage(box_names))
+    if(!client_.sendMessage(box_names, 5.0))
         throw std::runtime_error("Cannot get BoxNames!");
 
     // get box IDs
     msp::msg::BoxIds box_ids(fw_variant_);
-    if(!client_.sendMessage(box_ids))
+    if(!client_.sendMessage(box_ids, 5.0))
         throw std::runtime_error("Cannot get BoxIds!");
     assert(box_names.box_names.size() == box_ids.box_ids.size());
 
