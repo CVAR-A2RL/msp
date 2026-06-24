@@ -357,6 +357,12 @@ protected:
     std::thread thread;
     std::atomic_flag running_ = ATOMIC_FLAG_INIT;
 
+    // callback dispatch worker — runs subscription callbacks off the ASIO thread
+    // so the ASIO thread can immediately start reading the next frame
+    asio::io_service callback_io_;
+    std::unique_ptr<asio::io_service::work> callback_work_;
+    std::thread callback_thread_;
+
     // thread safety and synchronization
     std::condition_variable cv_response;
     std::mutex cv_response_mtx;

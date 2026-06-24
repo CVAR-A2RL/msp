@@ -90,7 +90,11 @@ bool Client::startReadThread() {
     if(!isConnected()) return false;
     // can't start if we are already running
     if(running_.test_and_set()) return false;
-    // hit it!
+
+    // start callback dispatch worker before the ASIO read thread
+    callback_work_ = std::make_unique<asio::io_service::work>(callback_io_);
+    callback_thread_ = std::thread([this] { callback_io_.run(); });
+
     thread = std::thread([this] {
         asio::async_read_until(port,
                                buffer,
@@ -113,6 +117,11 @@ bool Client::stopReadThread() {
         io.stop();
         thread.join();
         io.reset();
+        // stop the ASIO thread first so no new callbacks are posted,
+        // then drain the callback worker queue before joining
+        callback_work_.reset();
+        callback_thread_.join();
+        callback_io_.reset();
         rc = true;
     }
     running_.clear();
@@ -362,14 +371,20 @@ void Client::processOneMessage(const asio::error_code& ec,
     // notify waiting request methods
     cv_response.notify_all();
 
-    // check subscriptions
+    // check subscriptions — copy payload and dispatch to callback worker so
+    // the ASIO thread can immediately read the next frame without waiting for
+    // the user callback (e.g. ROS2 publish) to finish
     {
         std::lock_guard<std::mutex> lock(mutex_subscriptions);
         std::lock_guard<std::mutex> lock2(mutex_response);
         if(request_received->status == OK &&
            subscriptions.count(ID(request_received->id))) {
-            subscriptions.at(ID(request_received->id))
-                ->decode(request_received->payload);
+            auto sub = subscriptions.at(ID(request_received->id));
+            ByteVector payload_copy = request_received->payload;
+            callback_io_.post(
+                [sub, payload = std::move(payload_copy)]() mutable {
+                    sub->decode(payload);
+                });
         }
     }
 
