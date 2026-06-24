@@ -422,7 +422,11 @@ std::pair<iterator, bool> Client::messageReady(iterator begin,
         for(; i != end; ++i) {
             if(*i == '$') break;
         }
-        // implicitly consume all if $ not found
+        // Garbage data: discard everything up to the next '$' (or end of buffer)
+        // and tell async_read_until no match was found yet.  Returning true here
+        // would cause processOneMessage to misparse the garbage as a frame, which
+        // triggers the synchronous extractChar() fallback and blocks the event loop.
+        return std::make_pair(i, false);
     }
 
     return std::make_pair(i, true);
