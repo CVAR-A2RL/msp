@@ -478,14 +478,27 @@ std::pair<iterator, bool> Client::messageReady(iterator begin,
         std::advance(i, 8 + payload_size + 1);
     }
     else {
-        for(; i != end; ++i) {
-            if(*i == '$') break;
+        // Garbage data: scan forward for '$' followed by a valid MSP version
+        // byte ('M' for v1, 'X' for v2).  Requiring the version byte prevents
+        // stopping on a '$' that is embedded inside a payload (e.g. a 16-bit
+        // value whose low byte happens to be 0x24).
+        while (i != end) {
+            if (*i == '$') {
+                auto next = std::next(i);
+                if (next == end) {
+                    // '$' at the very end of the buffer — could be a valid frame
+                    // start; preserve it and wait for more data.
+                    return std::make_pair(i, false);
+                }
+                if (*next == 'M' || *next == 'X') {
+                    return std::make_pair(i, false);
+                }
+                // '$' not followed by a valid version byte — skip past it.
+            }
+            ++i;
         }
-        // Garbage data: discard everything up to the next '$' (or end of buffer)
-        // and tell async_read_until no match was found yet.  Returning true here
-        // would cause processOneMessage to misparse the garbage as a frame, which
-        // triggers the synchronous extractChar() fallback and blocks the event loop.
-        return std::make_pair(i, false);
+        // No valid frame start found; discard everything seen so far.
+        return std::make_pair(end, false);
     }
 
     return std::make_pair(i, true);
@@ -533,8 +546,15 @@ ReceivedMessage Client::processOneMessageV1() {
     }
 
     // CRC
-    const uint8_t rcv_crc = extractChar();
+    // Peek before consuming: if the next byte is '$', a UART framing error
+    // dropped the actual CRC byte and this '$' is the preamble of the next
+    // frame.  Leave it unconsumed so processOneMessage's resync scan finds it
+    // immediately and parses the next frame correctly instead of eating it as
+    // garbage.
     const uint8_t exp_crc = crcV1(id, ret.payload);
+    const uint8_t rcv_crc = (buffer.in_avail() > 0 && uint8_t(buffer.sgetc()) == '$')
+                             ? uint8_t(exp_crc ^ 0xFF)  // force mismatch; '$' stays in buffer
+                             : extractChar();
     const bool ok_crc     = (rcv_crc == exp_crc);
 
     if(log_level_ >= WARNING && !ok_crc) {
