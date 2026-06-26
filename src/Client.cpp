@@ -3,6 +3,7 @@
 #include <iostream>
 #include <linux/serial.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 
 typedef unsigned int uint;
 
@@ -65,6 +66,12 @@ bool Client::connectPort(const std::string& device, const size_t baudrate) {
             serial_info.flags |= ASYNC_LOW_LATENCY;
             ioctl(port.native_handle(), TIOCSSERIAL, &serial_info);
         }
+
+        // Discard any stale bytes sitting in the kernel TTY RX/TX buffers
+        // from a previous session.  Without this, leftover MSP response bytes
+        // appear at the head of the receive stream and corrupt the first few
+        // frames (manifests as CRC errors / unrecognised marker bytes).
+        tcflush(port.native_handle(), TCIOFLUSH);
     }
     catch(const std::system_error& e) {
         const int ecode = e.code().value();
@@ -341,11 +348,36 @@ void Client::processOneMessage(const asio::error_code& ec,
         return;
     }
 
-    // ignore and remove header bytes
-    const uint8_t msg_marker = extractChar();
-    if(msg_marker != '$')
-        std::cerr << "Message marker " << size_t(msg_marker)
-                  << " is not recognised!" << std::endl;
+    // async_read_until reports bytes_transferred measured from the real start
+    // of the streambuf, but messageReady may have found the '$' marker at a
+    // non-zero offset (after scanning past garbage bytes in the else branch).
+    // The get-pointer is still at position 0 (the garbage), so drain any
+    // prefix garbage bytes until we reach the '$' frame marker.
+    uint8_t msg_marker = extractChar();
+    while (msg_marker != '$') {
+        if(buffer.in_avail() == 0) {
+            // Exhausted buffered bytes without finding a frame — re-arm and
+            // wait for more data rather than doing a synchronous read here.
+            if(log_level_ >= WARNING)
+                std::cerr << "Lost sync: no '$' found, re-arming reader"
+                          << std::endl;
+            asio::async_read_until(port,
+                                   buffer,
+                                   std::bind(&Client::messageReady,
+                                             this,
+                                             std::placeholders::_1,
+                                             std::placeholders::_2),
+                                   std::bind(&Client::processOneMessage,
+                                             this,
+                                             std::placeholders::_1,
+                                             std::placeholders::_2));
+            return;
+        }
+        if(log_level_ >= WARNING)
+            std::cerr << "Skipping garbage byte: 0x" << std::hex
+                      << size_t(msg_marker) << std::dec << std::endl;
+        msg_marker = extractChar();
+    }
 
     // message version
     int ver                  = 0;
