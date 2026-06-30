@@ -152,6 +152,8 @@ enum class ID : uint16_t {
     MSP_COMPASS_CONFIG                 = 133,  // out message
     MSP_ESC_SENSOR_DATA                = 134,  // out message
     MSP_MOTOR_TELEMETRY                = 139,  // out message (Betaflight API >= 1.42)
+    MSP_RAW_GYRO                       = 146,  // out message  gyro XYZ deg/s
+    MSP_RAW_ACC                        = 147,  // out message  accel XYZ m/s² (512 counts = 1g)
     MSP_STATUS_EX                      = 150,
     MSP_SENSOR_STATUS                  = 151,  // only iNav
     MSP_UID                            = 160,
@@ -2822,6 +2824,54 @@ struct Status : public StatusBase, public Message {
         }
         s << std::endl;
 
+        return s;
+    }
+};
+
+// MSP_RAW_GYRO: 146
+struct RawGyro : public Message {
+    RawGyro(FirmwareVariant v) : Message(v) {}
+
+    virtual ID id() const override { return ID::MSP_RAW_GYRO; }
+
+    std::array<Value<float>, 3> gyro;  // deg/s
+
+    virtual bool decode(const ByteVector& data) override {
+        bool rc = true;
+        for(auto& g : gyro) {
+            rc &= data.unpack<int16_t>(g, 1.0f);
+        }
+        return rc;
+    }
+
+    virtual std::ostream& print(std::ostream& s) const override {
+        s << "#RawGyro:" << std::endl;
+        s << " Angular velocity: " << gyro[0] << ", " << gyro[1] << ", " << gyro[2] << " deg/s" << std::endl;
+        return s;
+    }
+};
+
+// MSP_RAW_ACC: 147
+// Firmware normalises to 512 counts = 1g regardless of sensor, so host needs no sensor-specific constants.
+struct RawAcc : public Message {
+    RawAcc(FirmwareVariant v) : Message(v) {}
+
+    virtual ID id() const override { return ID::MSP_RAW_ACC; }
+
+    std::array<Value<float>, 3> acc;  // m/s²
+
+    virtual bool decode(const ByteVector& data) override {
+        bool rc = true;
+        for(auto& a : acc) {
+            // 512 counts = 1g = 9.80665 m/s²  →  divisor = 512 / 9.80665
+            rc &= data.unpack<int16_t>(a, 512.0f / 9.80665f);
+        }
+        return rc;
+    }
+
+    virtual std::ostream& print(std::ostream& s) const override {
+        s << "#RawAcc:" << std::endl;
+        s << " Linear acceleration: " << acc[0] << ", " << acc[1] << ", " << acc[2] << " m/s²" << std::endl;
         return s;
     }
 };
