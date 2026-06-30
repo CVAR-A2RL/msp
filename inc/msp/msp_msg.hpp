@@ -3861,7 +3861,7 @@ struct BatteryState : public Message {
     Value<uint16_t> capacity_mAh;  // mAh
     Value<float> voltage;          // V
     Value<uint16_t> mAh_drawn;     // mAh
-    Value<uint16_t> amperage;      // A
+    Value<float> amperage;         // A
     Value<state_t> state;
 
     virtual bool decode(const ByteVector& data) override {
