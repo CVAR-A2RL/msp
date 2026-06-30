@@ -1,6 +1,9 @@
 #include <Client.hpp>
 #include <cstdlib>
 #include <iostream>
+#include <linux/serial.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 
 typedef unsigned int uint;
 
@@ -53,6 +56,22 @@ bool Client::connectPort(const std::string& device, const size_t baudrate) {
             asio::serial_port::character_size(8)));
         port.set_option(
             asio::serial_port::stop_bits(asio::serial_port::stop_bits::one));
+
+        // Ask the kernel TTY layer to deliver bytes to the application
+        // immediately rather than waiting to fill an inter-character gap.
+        // Without this the TTY driver may buffer a full MSP response for
+        // several hundred µs before waking ASIO, capping effective poll rate.
+        struct serial_struct serial_info;
+        if(ioctl(port.native_handle(), TIOCGSERIAL, &serial_info) == 0) {
+            serial_info.flags |= ASYNC_LOW_LATENCY;
+            ioctl(port.native_handle(), TIOCSSERIAL, &serial_info);
+        }
+
+        // Discard any stale bytes sitting in the kernel TTY RX/TX buffers
+        // from a previous session.  Without this, leftover MSP response bytes
+        // appear at the head of the receive stream and corrupt the first few
+        // frames (manifests as CRC errors / unrecognised marker bytes).
+        tcflush(port.native_handle(), TCIOFLUSH);
     }
     catch(const std::system_error& e) {
         const int ecode = e.code().value();
@@ -78,7 +97,11 @@ bool Client::startReadThread() {
     if(!isConnected()) return false;
     // can't start if we are already running
     if(running_.test_and_set()) return false;
-    // hit it!
+
+    // start callback dispatch worker before the ASIO read thread
+    callback_work_ = std::make_unique<asio::io_service::work>(callback_io_);
+    callback_thread_ = std::thread([this] { callback_io_.run(); });
+
     thread = std::thread([this] {
         asio::async_read_until(port,
                                buffer,
@@ -101,6 +124,11 @@ bool Client::stopReadThread() {
         io.stop();
         thread.join();
         io.reset();
+        // stop the ASIO thread first so no new callbacks are posted,
+        // then drain the callback worker queue before joining
+        callback_work_.reset();
+        callback_thread_.join();
+        callback_io_.reset();
         rc = true;
     }
     running_.clear();
@@ -320,11 +348,36 @@ void Client::processOneMessage(const asio::error_code& ec,
         return;
     }
 
-    // ignore and remove header bytes
-    const uint8_t msg_marker = extractChar();
-    if(msg_marker != '$')
-        std::cerr << "Message marker " << size_t(msg_marker)
-                  << " is not recognised!" << std::endl;
+    // async_read_until reports bytes_transferred measured from the real start
+    // of the streambuf, but messageReady may have found the '$' marker at a
+    // non-zero offset (after scanning past garbage bytes in the else branch).
+    // The get-pointer is still at position 0 (the garbage), so drain any
+    // prefix garbage bytes until we reach the '$' frame marker.
+    uint8_t msg_marker = extractChar();
+    while (msg_marker != '$') {
+        if(buffer.in_avail() == 0) {
+            // Exhausted buffered bytes without finding a frame — re-arm and
+            // wait for more data rather than doing a synchronous read here.
+            if(log_level_ >= WARNING)
+                std::cerr << "Lost sync: no '$' found, re-arming reader"
+                          << std::endl;
+            asio::async_read_until(port,
+                                   buffer,
+                                   std::bind(&Client::messageReady,
+                                             this,
+                                             std::placeholders::_1,
+                                             std::placeholders::_2),
+                                   std::bind(&Client::processOneMessage,
+                                             this,
+                                             std::placeholders::_1,
+                                             std::placeholders::_2));
+            return;
+        }
+        if(log_level_ >= WARNING)
+            std::cerr << "Skipping garbage byte: 0x" << std::hex
+                      << size_t(msg_marker) << std::dec << std::endl;
+        msg_marker = extractChar();
+    }
 
     // message version
     int ver                  = 0;
@@ -350,14 +403,20 @@ void Client::processOneMessage(const asio::error_code& ec,
     // notify waiting request methods
     cv_response.notify_all();
 
-    // check subscriptions
+    // check subscriptions — copy payload and dispatch to callback worker so
+    // the ASIO thread can immediately read the next frame without waiting for
+    // the user callback (e.g. ROS2 publish) to finish
     {
         std::lock_guard<std::mutex> lock(mutex_subscriptions);
         std::lock_guard<std::mutex> lock2(mutex_response);
         if(request_received->status == OK &&
            subscriptions.count(ID(request_received->id))) {
-            subscriptions.at(ID(request_received->id))
-                ->decode(request_received->payload);
+            auto sub = subscriptions.at(ID(request_received->id));
+            ByteVector payload_copy = request_received->payload;
+            callback_io_.post(
+                [sub, payload = std::move(payload_copy)]() mutable {
+                    sub->decode(payload);
+                });
         }
     }
 
@@ -419,10 +478,27 @@ std::pair<iterator, bool> Client::messageReady(iterator begin,
         std::advance(i, 8 + payload_size + 1);
     }
     else {
-        for(; i != end; ++i) {
-            if(*i == '$') break;
+        // Garbage data: scan forward for '$' followed by a valid MSP version
+        // byte ('M' for v1, 'X' for v2).  Requiring the version byte prevents
+        // stopping on a '$' that is embedded inside a payload (e.g. a 16-bit
+        // value whose low byte happens to be 0x24).
+        while (i != end) {
+            if (*i == '$') {
+                auto next = std::next(i);
+                if (next == end) {
+                    // '$' at the very end of the buffer — could be a valid frame
+                    // start; preserve it and wait for more data.
+                    return std::make_pair(i, false);
+                }
+                if (*next == 'M' || *next == 'X') {
+                    return std::make_pair(i, false);
+                }
+                // '$' not followed by a valid version byte — skip past it.
+            }
+            ++i;
         }
-        // implicitly consume all if $ not found
+        // No valid frame start found; discard everything seen so far.
+        return std::make_pair(end, false);
     }
 
     return std::make_pair(i, true);
@@ -470,8 +546,15 @@ ReceivedMessage Client::processOneMessageV1() {
     }
 
     // CRC
-    const uint8_t rcv_crc = extractChar();
+    // Peek before consuming: if the next byte is '$', a UART framing error
+    // dropped the actual CRC byte and this '$' is the preamble of the next
+    // frame.  Leave it unconsumed so processOneMessage's resync scan finds it
+    // immediately and parses the next frame correctly instead of eating it as
+    // garbage.
     const uint8_t exp_crc = crcV1(id, ret.payload);
+    const uint8_t rcv_crc = (buffer.in_avail() > 0 && uint8_t(buffer.sgetc()) == '$')
+                             ? uint8_t(exp_crc ^ 0xFF)  // force mismatch; '$' stays in buffer
+                             : extractChar();
     const bool ok_crc     = (rcv_crc == exp_crc);
 
     if(log_level_ >= WARNING && !ok_crc) {
